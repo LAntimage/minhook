@@ -29,8 +29,15 @@
 #include <windows.h>
 #include "buffer.h"
 
-// Size of each memory block. (= page size of VirtualAlloc)
-#define MEMORY_BLOCK_SIZE 0x1000
+// x64 trampolines must stay near their targets. Windows reservations start
+// at 64 KiB boundaries, so 4 KiB blocks strand the remaining 60 KiB and can
+// exhaust every usable address before a large hook set has been installed.
+// Use the full allocation granule; FreeBuffer uses the same block alignment.
+#if defined(_M_X64) || defined(__x86_64__)
+    #define MEMORY_BLOCK_SIZE 0x10000
+#else
+    #define MEMORY_BLOCK_SIZE 0x1000
+#endif
 
 // Max range for seeking a memory block. (= 1024MB)
 #define MAX_MEMORY_RANGE 0x40000000
@@ -160,7 +167,7 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
     minAddr = (ULONG_PTR)si.lpMinimumApplicationAddress;
     maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
 
-    // pOrigin ± 512MB
+    // pOrigin ± 1024MB
     if ((ULONG_PTR)pOrigin > MAX_MEMORY_RANGE && minAddr < (ULONG_PTR)pOrigin - MAX_MEMORY_RANGE)
         minAddr = (ULONG_PTR)pOrigin - MAX_MEMORY_RANGE;
 
