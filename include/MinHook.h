@@ -79,9 +79,73 @@ typedef enum MH_STATUS
     MH_ERROR_MODULE_NOT_FOUND,
 
     // The specified function is not found.
-    MH_ERROR_FUNCTION_NOT_FOUND
+    MH_ERROR_FUNCTION_NOT_FOUND,
+
+    // Invalid arguments to the optional buffer reservation API.
+    MH_ERROR_INVALID_PARAMETER
 }
 MH_STATUS;
+
+// Optional diagnostics for this MinHook instance. The most
+// recent allocation attempts are retained without allocating diagnostic memory.
+#define MH_MEMORY_ATTEMPT_HISTORY 64
+typedef enum MH_MEMORY_FAILURE_STAGE
+{
+    MH_MEMORY_NO_REGION,
+    MH_MEMORY_VIRTUAL_QUERY,
+    MH_MEMORY_VIRTUAL_ALLOC,
+    MH_MEMORY_HEAP_CREATE,
+    MH_MEMORY_HEAP_ALLOC,
+    MH_MEMORY_HEAP_REALLOC
+} MH_MEMORY_FAILURE_STAGE;
+
+typedef struct MH_MEMORY_ATTEMPT
+{
+    UINT sequence;
+    LPVOID address;
+    SIZE_T size;
+    LPVOID result;
+    DWORD error; // Captured immediately after a failed VirtualAlloc.
+} MH_MEMORY_ATTEMPT;
+
+typedef struct MH_MEMORY_DIAGNOSTICS
+{
+    LPVOID target;
+    MH_MEMORY_FAILURE_STAGE stage;
+    DWORD error;
+    BOOL errorValid; // HeapAlloc/HeapReAlloc do not provide GetLastError.
+    ULONG_PTR minAddress;
+    ULONG_PTR maxAddress; // Highest permitted allocation base, inclusive.
+    SIZE_T blockSize;
+    DWORD allocationGranularity;
+    UINT queries;
+    UINT queryFailures;
+    LPVOID lastQueryAddress;
+    DWORD lastQueryError;
+    UINT attempts;
+    UINT allocationFailures;
+    DWORD lastAllocationError;
+    SIZE_T heapBytes;
+    BOOL fallbackTried;
+    SIZE_T minimumBlockSize;
+    LPVOID allocatedBlock;
+    SIZE_T allocatedBlockSize;
+    MH_MEMORY_ATTEMPT history[MH_MEMORY_ATTEMPT_HISTORY];
+} MH_MEMORY_DIAGNOSTICS;
+
+// Invoked only on MH_ERROR_MEMORY_ALLOC, after releasing MinHook's lock and
+// before returning to its caller. The snapshot is valid during this callback.
+typedef VOID (WINAPI *MH_MEMORY_FAILURE_CALLBACK)(const MH_MEMORY_DIAGNOSTICS* diagnostics);
+
+typedef struct MH_BUFFER_RESERVATION
+{
+    LPVOID firstBlock;
+    SIZE_T firstBlockSize;
+    SIZE_T blockCount;
+    SIZE_T totalBytes;
+    SIZE_T capacity;
+    SIZE_T usedSlots;
+} MH_BUFFER_RESERVATION;
 
 // Can be passed as a parameter to MH_EnableHook, MH_DisableHook,
 // MH_QueueEnableHook or MH_QueueDisableHook.
@@ -91,9 +155,24 @@ MH_STATUS;
 extern "C" {
 #endif
 
+    VOID WINAPI MH_SetMemoryFailureCallback(MH_MEMORY_FAILURE_CALLBACK callback);
+
+    // Same snapshot/lifetime rules, called when creating a hook or reserving
+    // buffers succeeds using a newly allocated smaller block. Ordinary 64 KiB
+    // success and reuse of existing blocks do not notify this callback.
+    VOID WINAPI MH_SetMemoryFallbackCallback(MH_MEMORY_FAILURE_CALLBACK callback);
+
     // Initialize the MinHook library. You must call this function EXACTLY ONCE
     // at the beginning of your program.
     MH_STATUS WINAPI MH_Initialize(VOID);
+
+    // Ensure total reserved capacity for the inclusive target address range.
+    // Does not read/patch targets or create/enable hooks. Repeated calls count
+    // existing reservations, including occupied slots. Buffers remain available
+    // until MH_Uninitialize, even when all hooks using them have been removed.
+    // On allocation failure, partial reservations are retained and reported.
+    MH_STATUS WINAPI MH_ReserveHookBuffers(LPVOID firstTarget, LPVOID lastTarget,
+        SIZE_T minimumSlots, MH_BUFFER_RESERVATION* reservation);
 
     // Uninitialize the MinHook library. You must call this function EXACTLY
     // ONCE at the end of your program.

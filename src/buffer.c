@@ -28,11 +28,13 @@
 
 #include <windows.h>
 #include "buffer.h"
+#include "diagnostics.h"
 
 // x64 trampolines must stay near their targets. Windows reservations start
 // at 64 KiB boundaries, so 4 KiB blocks strand the remaining 60 KiB and can
 // exhaust every usable address before a large hook set has been installed.
-// Use the full allocation granule; FreeBuffer uses the same block alignment.
+// Prefer the full allocation granule. Only after that search is exhausted,
+// use a smaller page-aligned block that fits an available reservation base.
 #if defined(_M_X64) || defined(__x86_64__)
     #define MEMORY_BLOCK_SIZE 0x10000
 #else
@@ -62,7 +64,11 @@ typedef struct _MEMORY_BLOCK
     struct _MEMORY_BLOCK *pNext;
     PMEMORY_SLOT pFree;         // First element of the free slot list.
     UINT usedCount;
+    SIZE_T size;               // Actual allocation size, including the header.
+    BOOL reserved;             // Keep early reservations until Uninitialize.
 } MEMORY_BLOCK, *PMEMORY_BLOCK;
+
+typedef char MEMORY_BLOCK_HEADER_FITS_SLOT[(sizeof(MEMORY_BLOCK) <= sizeof(MEMORY_SLOT)) ? 1 : -1];
 
 //-------------------------------------------------------------------------
 // Global Variables:
@@ -70,6 +76,24 @@ typedef struct _MEMORY_BLOCK
 
 // First element of the memory block list.
 PMEMORY_BLOCK g_pMemoryBlocks;
+
+static SIZE_T QueryAllocationRegion(LPVOID address, MEMORY_BASIC_INFORMATION* info)
+{
+    SIZE_T result = VirtualQuery(address, info, sizeof(*info));
+    DWORD error = result == 0 ? GetLastError() : ERROR_SUCCESS;
+    MemoryDiagnosticsQuery(address, result != 0, error);
+    return result;
+}
+
+static PMEMORY_BLOCK AllocateMemoryBlock(LPVOID address, SIZE_T size)
+{
+    PMEMORY_BLOCK result = (PMEMORY_BLOCK)VirtualAlloc(
+        address, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    DWORD error = result == NULL ? GetLastError() : ERROR_SUCCESS;
+    MemoryDiagnosticsAllocation(address, size, result, error);
+    if (result != NULL) result->size = size;
+    return result;
+}
 
 //-------------------------------------------------------------------------
 VOID InitializeBuffer(VOID)
@@ -106,7 +130,7 @@ static LPVOID FindPrevFreeRegion(LPVOID pAddress, LPVOID pMinAddr, DWORD dwAlloc
     while (tryAddr >= (ULONG_PTR)pMinAddr)
     {
         MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery((LPVOID)tryAddr, &mbi, sizeof(mbi)) == 0)
+        if (QueryAllocationRegion((LPVOID)tryAddr, &mbi) == 0)
             break;
 
         if (mbi.State == MEM_FREE)
@@ -137,7 +161,7 @@ static LPVOID FindNextFreeRegion(LPVOID pAddress, LPVOID pMaxAddr, DWORD dwAlloc
     while (tryAddr <= (ULONG_PTR)pMaxAddr)
     {
         MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery((LPVOID)tryAddr, &mbi, sizeof(mbi)) == 0)
+        if (QueryAllocationRegion((LPVOID)tryAddr, &mbi) == 0)
             break;
 
         if (mbi.State == MEM_FREE)
@@ -155,9 +179,163 @@ static LPVOID FindNextFreeRegion(LPVOID pAddress, LPVOID pMaxAddr, DWORD dwAlloc
 #endif
 
 //-------------------------------------------------------------------------
+#if defined(_M_X64) || defined(__x86_64__)
+static PMEMORY_BLOCK AllocateSmallerBlock(LPVOID address, ULONG_PTR maxAddress, DWORD pageSize)
+{
+    MEMORY_BASIC_INFORMATION info;
+    SIZE_T available, size;
+    ULONG_PTR start = (ULONG_PTR)address;
+    PMEMORY_BLOCK block;
+
+    // Re-query after the 64 KiB pass: another thread may have claimed this
+    // address. Never commit into, split, or release another allocation.
+    if (!QueryAllocationRegion(address, &info) || info.State != MEM_FREE ||
+        start < (ULONG_PTR)info.BaseAddress || start > maxAddress)
+        return NULL;
+    available = info.RegionSize - (start - (ULONG_PTR)info.BaseAddress);
+    if (available > maxAddress - start + 1) available = maxAddress - start + 1;
+    size = MEMORY_BLOCK_SIZE - pageSize;
+    if (size > available) size = available;
+    size -= size % pageSize;
+
+    // Prefer the largest useful block (e.g. the 60 KiB hole in the client log),
+    // rather than stranding its remaining pages with an immediate 4 KiB retry.
+    for (; size >= pageSize; size -= pageSize)
+    {
+        block = AllocateMemoryBlock(address, size);
+        if (block != NULL) return block;
+    }
+    return NULL;
+}
+
+static PMEMORY_BLOCK FindAndAllocateBlock(LPVOID origin, ULONG_PTR minAddress, ULONG_PTR maxAddress,
+    const SYSTEM_INFO* system, BOOL fallback)
+{
+    LPVOID candidate = origin;
+    PMEMORY_BLOCK block;
+    SIZE_T minimumSize = fallback ? system->dwPageSize : MEMORY_BLOCK_SIZE;
+    ULONG_PTR maxBase = maxAddress - (minimumSize - 1);
+
+    if (maxAddress < minimumSize - 1 || maxBase < minAddress) return NULL;
+
+    while ((ULONG_PTR)candidate >= minAddress)
+    {
+        candidate = FindPrevFreeRegion(candidate, (LPVOID)minAddress, system->dwAllocationGranularity);
+        if (candidate == NULL) break;
+        block = fallback ? AllocateSmallerBlock(candidate, maxAddress, system->dwPageSize) :
+            AllocateMemoryBlock(candidate, MEMORY_BLOCK_SIZE);
+        if (block != NULL) return block;
+    }
+    candidate = origin;
+    while ((ULONG_PTR)candidate <= maxBase)
+    {
+        candidate = FindNextFreeRegion(candidate, (LPVOID)maxBase, system->dwAllocationGranularity);
+        if (candidate == NULL) break;
+        block = fallback ? AllocateSmallerBlock(candidate, maxAddress, system->dwPageSize) :
+            AllocateMemoryBlock(candidate, MEMORY_BLOCK_SIZE);
+        if (block != NULL) return block;
+    }
+    return NULL;
+}
+#endif
+
+//-------------------------------------------------------------------------
+static VOID RegisterMemoryBlock(PMEMORY_BLOCK pBlock, BOOL reserved)
+{
+    PMEMORY_SLOT pSlot = (PMEMORY_SLOT)pBlock + 1;
+    pBlock->pFree = NULL;
+    pBlock->usedCount = 0;
+    pBlock->reserved = reserved;
+    do
+    {
+        pSlot->pNext = pBlock->pFree;
+        pBlock->pFree = pSlot;
+        pSlot++;
+    } while ((ULONG_PTR)pSlot - (ULONG_PTR)pBlock <= pBlock->size - MEMORY_SLOT_SIZE);
+
+    pBlock->pNext = g_pMemoryBlocks;
+    g_pMemoryBlocks = pBlock;
+}
+
+static BOOL BlockInRange(PMEMORY_BLOCK block, ULONG_PTR minAddress, ULONG_PTR maxAddress)
+{
+    ULONG_PTR base = (ULONG_PTR)block;
+    return base >= minAddress && base <= maxAddress && block->size - 1 <= maxAddress - base;
+}
+
+static VOID DescribeReservation(ULONG_PTR minAddress, ULONG_PTR maxAddress, MH_BUFFER_RESERVATION* result)
+{
+    PMEMORY_BLOCK block;
+    ZeroMemory(result, sizeof(*result));
+    for (block = g_pMemoryBlocks; block != NULL; block = block->pNext)
+    {
+        if (!block->reserved || !BlockInRange(block, minAddress, maxAddress)) continue;
+        if (result->firstBlock == NULL)
+        {
+            result->firstBlock = block;
+            result->firstBlockSize = block->size;
+        }
+        ++result->blockCount;
+        result->totalBytes += block->size;
+        result->capacity += block->size / MEMORY_SLOT_SIZE - 1;
+        result->usedSlots += block->usedCount;
+    }
+}
+
+BOOL ReserveHookBuffers(LPVOID firstTarget, LPVOID lastTarget, SIZE_T minimumSlots, MH_BUFFER_RESERVATION* result)
+{
+    SYSTEM_INFO system;
+    ULONG_PTR minAddress, maxAddress;
+    PMEMORY_BLOCK block;
+    GetSystemInfo(&system);
+    minAddress = (ULONG_PTR)system.lpMinimumApplicationAddress;
+    maxAddress = (ULONG_PTR)system.lpMaximumApplicationAddress;
+#if defined(_M_X64) || defined(__x86_64__)
+    // Intersection of all targets' existing +/- 1 GiB windows. Every slot in
+    // this pool must be reachable by every target, not just the first hook.
+    if ((ULONG_PTR)lastTarget > MAX_MEMORY_RANGE && minAddress < (ULONG_PTR)lastTarget - MAX_MEMORY_RANGE)
+        minAddress = (ULONG_PTR)lastTarget - MAX_MEMORY_RANGE;
+    if ((ULONG_PTR)firstTarget <= maxAddress && maxAddress - (ULONG_PTR)firstTarget > MAX_MEMORY_RANGE)
+        maxAddress = (ULONG_PTR)firstTarget + MAX_MEMORY_RANGE;
+#else
+    (void)firstTarget;
+    (void)lastTarget;
+#endif
+    DescribeReservation(minAddress, maxAddress, result);
+    if (maxAddress < minAddress || maxAddress - minAddress < system.dwPageSize - 1)
+    {
+        MemoryDiagnosticsBufferFailure();
+        return FALSE;
+    }
+    MemoryDiagnosticsRange(minAddress, maxAddress - (MEMORY_BLOCK_SIZE - 1), MEMORY_BLOCK_SIZE, system.dwAllocationGranularity);
+    while (result->capacity < minimumSlots)
+    {
+#if defined(_M_X64) || defined(__x86_64__)
+        LPVOID origin = (LPVOID)((ULONG_PTR)firstTarget + ((ULONG_PTR)lastTarget - (ULONG_PTR)firstTarget) / 2);
+        block = FindAndAllocateBlock(origin, minAddress, maxAddress, &system, FALSE);
+        if (block == NULL && system.dwPageSize < MEMORY_BLOCK_SIZE)
+        {
+            MemoryDiagnosticsFallback(system.dwPageSize);
+            block = FindAndAllocateBlock(origin, minAddress, maxAddress, &system, TRUE);
+        }
+#else
+        block = AllocateMemoryBlock(NULL, MEMORY_BLOCK_SIZE);
+#endif
+        if (block == NULL)
+        {
+            MemoryDiagnosticsBufferFailure();
+            return FALSE;
+        }
+        RegisterMemoryBlock(block, TRUE);
+        DescribeReservation(minAddress, maxAddress, result);
+    }
+    return TRUE;
+}
+
+//-------------------------------------------------------------------------
 static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
 {
-    PMEMORY_BLOCK pBlock;
+    PMEMORY_BLOCK pBlock = NULL;
 #if defined(_M_X64) || defined(__x86_64__)
     ULONG_PTR minAddr;
     ULONG_PTR maxAddr;
@@ -174,8 +352,11 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
     if (maxAddr > (ULONG_PTR)pOrigin + MAX_MEMORY_RANGE)
         maxAddr = (ULONG_PTR)pOrigin + MAX_MEMORY_RANGE;
 
-    // Make room for MEMORY_BLOCK_SIZE bytes.
-    maxAddr -= MEMORY_BLOCK_SIZE - 1;
+    // Keep the original address window for both passes; smaller blocks may
+    // also fit near its upper edge. Diagnostics retain the preferred size.
+    MemoryDiagnosticsRange(minAddr, maxAddr - (MEMORY_BLOCK_SIZE - 1), MEMORY_BLOCK_SIZE, si.dwAllocationGranularity);
+#else
+    MemoryDiagnosticsRange(0, 0, MEMORY_BLOCK_SIZE, 0);
 #endif
 
     // Look the registered blocks for a reachable one.
@@ -183,7 +364,7 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
     {
 #if defined(_M_X64) || defined(__x86_64__)
         // Ignore the blocks too far.
-        if ((ULONG_PTR)pBlock < minAddr || (ULONG_PTR)pBlock >= maxAddr)
+        if (!BlockInRange(pBlock, minAddr, maxAddr))
             continue;
 #endif
         // The block has at least one unused slot.
@@ -192,59 +373,21 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
     }
 
 #if defined(_M_X64) || defined(__x86_64__)
-    // Alloc a new block above if not found.
+    // Exhaust the normal 64 KiB search in both directions before falling back.
+    pBlock = FindAndAllocateBlock(pOrigin, minAddr, maxAddr, &si, FALSE);
+    if (pBlock == NULL && si.dwPageSize < MEMORY_BLOCK_SIZE)
     {
-        LPVOID pAlloc = pOrigin;
-        while ((ULONG_PTR)pAlloc >= minAddr)
-        {
-            pAlloc = FindPrevFreeRegion(pAlloc, (LPVOID)minAddr, si.dwAllocationGranularity);
-            if (pAlloc == NULL)
-                break;
-
-            pBlock = (PMEMORY_BLOCK)VirtualAlloc(
-                pAlloc, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (pBlock != NULL)
-                break;
-        }
-    }
-
-    // Alloc a new block below if not found.
-    if (pBlock == NULL)
-    {
-        LPVOID pAlloc = pOrigin;
-        while ((ULONG_PTR)pAlloc <= maxAddr)
-        {
-            pAlloc = FindNextFreeRegion(pAlloc, (LPVOID)maxAddr, si.dwAllocationGranularity);
-            if (pAlloc == NULL)
-                break;
-
-            pBlock = (PMEMORY_BLOCK)VirtualAlloc(
-                pAlloc, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (pBlock != NULL)
-                break;
-        }
+        MemoryDiagnosticsFallback(si.dwPageSize);
+        pBlock = FindAndAllocateBlock(pOrigin, minAddr, maxAddr, &si, TRUE);
     }
 #else
     // In x86 mode, a memory block can be placed anywhere.
-    pBlock = (PMEMORY_BLOCK)VirtualAlloc(
-        NULL, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    pBlock = AllocateMemoryBlock(NULL, MEMORY_BLOCK_SIZE);
 #endif
 
     if (pBlock != NULL)
     {
-        // Build a linked list of all the slots.
-        PMEMORY_SLOT pSlot = (PMEMORY_SLOT)pBlock + 1;
-        pBlock->pFree = NULL;
-        pBlock->usedCount = 0;
-        do
-        {
-            pSlot->pNext = pBlock->pFree;
-            pBlock->pFree = pSlot;
-            pSlot++;
-        } while ((ULONG_PTR)pSlot - (ULONG_PTR)pBlock <= MEMORY_BLOCK_SIZE - MEMORY_SLOT_SIZE);
-
-        pBlock->pNext = g_pMemoryBlocks;
-        g_pMemoryBlocks = pBlock;
+        RegisterMemoryBlock(pBlock, FALSE);
     }
 
     return pBlock;
@@ -256,7 +399,10 @@ LPVOID AllocateBuffer(LPVOID pOrigin)
     PMEMORY_SLOT  pSlot;
     PMEMORY_BLOCK pBlock = GetMemoryBlock(pOrigin);
     if (pBlock == NULL)
+    {
+        MemoryDiagnosticsBufferFailure();
         return NULL;
+    }
 
     // Remove an unused slot from the list.
     pSlot = pBlock->pFree;
@@ -274,11 +420,13 @@ VOID FreeBuffer(LPVOID pBuffer)
 {
     PMEMORY_BLOCK pBlock = g_pMemoryBlocks;
     PMEMORY_BLOCK pPrev = NULL;
-    ULONG_PTR pTargetBlock = ((ULONG_PTR)pBuffer / MEMORY_BLOCK_SIZE) * MEMORY_BLOCK_SIZE;
 
     while (pBlock != NULL)
     {
-        if ((ULONG_PTR)pBlock == pTargetBlock)
+        // Blocks can have different sizes. Find the actual owner rather than
+        // inferring it from a fixed-size block boundary.
+        if ((ULONG_PTR)pBuffer >= (ULONG_PTR)pBlock + MEMORY_SLOT_SIZE &&
+            (ULONG_PTR)pBuffer - (ULONG_PTR)pBlock < pBlock->size)
         {
             PMEMORY_SLOT pSlot = (PMEMORY_SLOT)pBuffer;
 #ifdef _DEBUG
@@ -291,7 +439,7 @@ VOID FreeBuffer(LPVOID pBuffer)
             pBlock->usedCount--;
 
             // Free if unused.
-            if (pBlock->usedCount == 0)
+            if (pBlock->usedCount == 0 && !pBlock->reserved)
             {
                 if (pPrev)
                     pPrev->pNext = pBlock->pNext;

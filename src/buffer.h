@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include "../include/MinHook.h"
+
 // Size of each memory slot.
 #if defined(_M_X64) || defined(__x86_64__)
     #define MEMORY_SLOT_SIZE 64
@@ -40,3 +42,4 @@ VOID   UninitializeBuffer(VOID);
 LPVOID AllocateBuffer(LPVOID pOrigin);
 VOID   FreeBuffer(LPVOID pBuffer);
 BOOL   IsExecutableAddress(LPVOID pAddress);
+BOOL   ReserveHookBuffers(LPVOID firstTarget, LPVOID lastTarget, SIZE_T minimumSlots, MH_BUFFER_RESERVATION* reservation);

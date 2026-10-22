@@ -1,6 +1,9 @@
 EXPORTS
     MH_Initialize
     MH_Uninitialize
+    MH_ReserveHookBuffers
+    MH_SetMemoryFailureCallback
+    MH_SetMemoryFallbackCallback
 
     MH_CreateHook
     MH_CreateHookApi

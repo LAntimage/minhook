@@ -33,6 +33,7 @@
 #include "../include/MinHook.h"
 #include "buffer.h"
 #include "trampoline.h"
+#include "diagnostics.h"
 
 #ifndef ARRAYSIZE
     #define ARRAYSIZE(A) (sizeof(A)/sizeof((A)[0]))
@@ -100,6 +101,103 @@ struct
     UINT        size;       // Actual number of data items
 } g_hooks;
 
+static MH_MEMORY_FAILURE_CALLBACK g_memoryFailureCallback;
+static MH_MEMORY_FAILURE_CALLBACK g_memoryFallbackCallback;
+static MH_MEMORY_DIAGNOSTICS g_memoryDiagnostics;
+
+static VOID BeginMemoryDiagnostics(LPVOID target)
+{
+    if (g_memoryFailureCallback != NULL || g_memoryFallbackCallback != NULL)
+    {
+        ZeroMemory(&g_memoryDiagnostics, sizeof(g_memoryDiagnostics));
+        g_memoryDiagnostics.target = target;
+    }
+}
+
+VOID MemoryDiagnosticsRange(ULONG_PTR minAddress, ULONG_PTR maxAddress, SIZE_T blockSize, DWORD granularity)
+{
+    if (g_memoryFailureCallback == NULL && g_memoryFallbackCallback == NULL) return;
+    g_memoryDiagnostics.minAddress = minAddress;
+    g_memoryDiagnostics.maxAddress = maxAddress;
+    g_memoryDiagnostics.blockSize = blockSize;
+    g_memoryDiagnostics.minimumBlockSize = blockSize;
+    g_memoryDiagnostics.allocationGranularity = granularity;
+}
+
+VOID MemoryDiagnosticsQuery(LPVOID address, BOOL success, DWORD error)
+{
+    if (g_memoryFailureCallback == NULL && g_memoryFallbackCallback == NULL) return;
+    ++g_memoryDiagnostics.queries;
+    if (!success)
+    {
+        ++g_memoryDiagnostics.queryFailures;
+        g_memoryDiagnostics.lastQueryAddress = address;
+        g_memoryDiagnostics.lastQueryError = error;
+    }
+}
+
+VOID MemoryDiagnosticsAllocation(LPVOID address, SIZE_T size, LPVOID result, DWORD error)
+{
+    MH_MEMORY_ATTEMPT* attempt;
+    if (g_memoryFailureCallback == NULL && g_memoryFallbackCallback == NULL) return;
+    attempt = &g_memoryDiagnostics.history[g_memoryDiagnostics.attempts % MH_MEMORY_ATTEMPT_HISTORY];
+    attempt->sequence = ++g_memoryDiagnostics.attempts;
+    attempt->address = address;
+    attempt->size = size;
+    attempt->result = result;
+    attempt->error = error;
+    if (result == NULL)
+    {
+        ++g_memoryDiagnostics.allocationFailures;
+        g_memoryDiagnostics.lastAllocationError = error;
+    }
+    else
+    {
+        g_memoryDiagnostics.allocatedBlock = result;
+        g_memoryDiagnostics.allocatedBlockSize = size;
+    }
+}
+
+VOID MemoryDiagnosticsFallback(SIZE_T minimumBlockSize)
+{
+    if (g_memoryFailureCallback == NULL && g_memoryFallbackCallback == NULL) return;
+    g_memoryDiagnostics.fallbackTried = TRUE;
+    g_memoryDiagnostics.minimumBlockSize = minimumBlockSize;
+}
+
+VOID MemoryDiagnosticsBufferFailure(VOID)
+{
+    if (g_memoryFailureCallback == NULL && g_memoryFallbackCallback == NULL) return;
+    if (g_memoryDiagnostics.allocationFailures)
+    {
+        g_memoryDiagnostics.stage = MH_MEMORY_VIRTUAL_ALLOC;
+        g_memoryDiagnostics.error = g_memoryDiagnostics.lastAllocationError;
+        g_memoryDiagnostics.errorValid = TRUE;
+    }
+    else if (g_memoryDiagnostics.queryFailures)
+    {
+        g_memoryDiagnostics.stage = MH_MEMORY_VIRTUAL_QUERY;
+        g_memoryDiagnostics.error = g_memoryDiagnostics.lastQueryError;
+        g_memoryDiagnostics.errorValid = TRUE;
+    }
+    else
+    {
+        // No allocation API was called: there is no Windows allocation error.
+        g_memoryDiagnostics.stage = MH_MEMORY_NO_REGION;
+        g_memoryDiagnostics.error = ERROR_SUCCESS;
+        g_memoryDiagnostics.errorValid = FALSE;
+    }
+}
+
+static VOID MemoryDiagnosticsHeapFailure(MH_MEMORY_FAILURE_STAGE stage, SIZE_T bytes, DWORD error, BOOL valid)
+{
+    if (g_memoryFailureCallback == NULL && g_memoryFallbackCallback == NULL) return;
+    g_memoryDiagnostics.stage = stage;
+    g_memoryDiagnostics.heapBytes = bytes;
+    g_memoryDiagnostics.error = error;
+    g_memoryDiagnostics.errorValid = valid;
+}
+
 //-------------------------------------------------------------------------
 // Returns INVALID_HOOK_POS if not found.
 static UINT FindHookEntry(LPVOID pTarget)
@@ -123,14 +221,22 @@ static PHOOK_ENTRY AddHookEntry()
         g_hooks.pItems = (PHOOK_ENTRY)HeapAlloc(
             g_hHeap, 0, g_hooks.capacity * sizeof(HOOK_ENTRY));
         if (g_hooks.pItems == NULL)
+        {
+            MemoryDiagnosticsHeapFailure(MH_MEMORY_HEAP_ALLOC,
+                g_hooks.capacity * sizeof(HOOK_ENTRY), GetLastError(), FALSE);
             return NULL;
+        }
     }
     else if (g_hooks.size >= g_hooks.capacity)
     {
         PHOOK_ENTRY p = (PHOOK_ENTRY)HeapReAlloc(
             g_hHeap, 0, g_hooks.pItems, (g_hooks.capacity * 2) * sizeof(HOOK_ENTRY));
         if (p == NULL)
+        {
+            MemoryDiagnosticsHeapFailure(MH_MEMORY_HEAP_REALLOC,
+                (g_hooks.capacity * 2) * sizeof(HOOK_ENTRY), GetLastError(), FALSE);
             return NULL;
+        }
 
         g_hooks.capacity *= 2;
         g_hooks.pItems = p;
@@ -462,12 +568,46 @@ static VOID LeaveSpinLock(VOID)
     InterlockedExchange(&g_isLocked, FALSE);
 }
 
+VOID WINAPI MH_SetMemoryFailureCallback(MH_MEMORY_FAILURE_CALLBACK callback)
+{
+    EnterSpinLock();
+    g_memoryFailureCallback = callback;
+    LeaveSpinLock();
+}
+
+VOID WINAPI MH_SetMemoryFallbackCallback(MH_MEMORY_FAILURE_CALLBACK callback)
+{
+    EnterSpinLock();
+    g_memoryFallbackCallback = callback;
+    LeaveSpinLock();
+}
+
+// Copy while locked, then notify without the lock. Logging may itself use
+// Windows allocation APIs, so preserve the caller-visible last-error value.
+static VOID LeaveSpinLockWithMemoryDiagnostics(MH_STATUS status)
+{
+    MH_MEMORY_FAILURE_CALLBACK callback = status == MH_ERROR_MEMORY_ALLOC ? g_memoryFailureCallback : NULL;
+    MH_MEMORY_DIAGNOSTICS snapshot;
+    DWORD error = GetLastError();
+    if (status == MH_OK && g_memoryDiagnostics.fallbackTried && g_memoryDiagnostics.allocatedBlock != NULL &&
+        g_memoryDiagnostics.allocatedBlockSize < g_memoryDiagnostics.blockSize)
+        callback = g_memoryFallbackCallback;
+    if (callback != NULL) snapshot = g_memoryDiagnostics;
+    LeaveSpinLock();
+    if (callback != NULL)
+    {
+        callback(&snapshot);
+        SetLastError(error);
+    }
+}
+
 //-------------------------------------------------------------------------
 MH_STATUS WINAPI MH_Initialize(VOID)
 {
     MH_STATUS status = MH_OK;
 
     EnterSpinLock();
+    BeginMemoryDiagnostics(NULL);
 
     if (g_hHeap == NULL)
     {
@@ -479,6 +619,7 @@ MH_STATUS WINAPI MH_Initialize(VOID)
         }
         else
         {
+            MemoryDiagnosticsHeapFailure(MH_MEMORY_HEAP_CREATE, 0, GetLastError(), TRUE);
             status = MH_ERROR_MEMORY_ALLOC;
         }
     }
@@ -487,7 +628,7 @@ MH_STATUS WINAPI MH_Initialize(VOID)
         status = MH_ERROR_ALREADY_INITIALIZED;
     }
 
-    LeaveSpinLock();
+    LeaveSpinLockWithMemoryDiagnostics(status);
 
     return status;
 }
@@ -532,11 +673,31 @@ MH_STATUS WINAPI MH_Uninitialize(VOID)
 }
 
 //-------------------------------------------------------------------------
+MH_STATUS WINAPI MH_ReserveHookBuffers(LPVOID firstTarget, LPVOID lastTarget,
+    SIZE_T minimumSlots, MH_BUFFER_RESERVATION* reservation)
+{
+    MH_STATUS status = MH_OK;
+    EnterSpinLock();
+    BeginMemoryDiagnostics(firstTarget);
+    if (reservation != NULL) ZeroMemory(reservation, sizeof(*reservation));
+    if (g_hHeap == NULL)
+        status = MH_ERROR_NOT_INITIALIZED;
+    else if (firstTarget == NULL || (ULONG_PTR)lastTarget < (ULONG_PTR)firstTarget ||
+        minimumSlots == 0 || reservation == NULL)
+        status = MH_ERROR_INVALID_PARAMETER;
+    else if (!ReserveHookBuffers(firstTarget, lastTarget, minimumSlots, reservation))
+        status = MH_ERROR_MEMORY_ALLOC;
+    LeaveSpinLockWithMemoryDiagnostics(status);
+    return status;
+}
+
+//-------------------------------------------------------------------------
 MH_STATUS WINAPI MH_CreateHook(LPVOID pTarget, LPVOID pDetour, LPVOID *ppOriginal)
 {
     MH_STATUS status = MH_OK;
 
     EnterSpinLock();
+    BeginMemoryDiagnostics(pTarget);
 
     if (g_hHeap != NULL)
     {
@@ -624,7 +785,7 @@ MH_STATUS WINAPI MH_CreateHook(LPVOID pTarget, LPVOID pDetour, LPVOID *ppOrigina
         status = MH_ERROR_NOT_INITIALIZED;
     }
 
-    LeaveSpinLock();
+    LeaveSpinLockWithMemoryDiagnostics(status);
 
     return status;
 }
@@ -881,6 +1042,7 @@ const char * WINAPI MH_StatusToString(MH_STATUS status)
         MH_ST2STR(MH_ERROR_MEMORY_PROTECT)
         MH_ST2STR(MH_ERROR_MODULE_NOT_FOUND)
         MH_ST2STR(MH_ERROR_FUNCTION_NOT_FOUND)
+        MH_ST2STR(MH_ERROR_INVALID_PARAMETER)
     }
 
 #undef MH_ST2STR
